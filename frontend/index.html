@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#090d18" />
+    <meta name="description" content="VOICEMATRIX — Experimental AI voice-clone detection and scam prevention." />
+    <title>VOICEMATRIX | Voice Intelligence</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  
+<script id="vm-phase2-launcher-script">
+(() => {
+  if (document.getElementById("vm-phase2-launcher")) return;
+
+  const style = document.createElement("style");
+  style.textContent = `
+    #vm-phase2-launcher {
+      position: fixed;
+      right: 22px;
+      bottom: 22px;
+      z-index: 99999;
+      font-family: system-ui, sans-serif;
+    }
+    #vm-phase2-toggle {
+      width: 50px;
+      height: 50px;
+      padding: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border: 1px solid #111;
+      border-radius: 50%;
+      background: #fff;
+      color: #111;
+      cursor: pointer;
+      box-shadow: 0 4px 16px #0005;
+      transition: transform 0.18s ease, background 0.18s ease;
+    }
+    #vm-phase2-toggle:hover {
+      background: #eaeaea;
+      transform: translateY(-2px);
+    }
+    #vm-phase2-toggle:focus-visible {
+      outline: 2px solid #fff;
+      outline-offset: 4px;
+    }
+    #vm-phase2-toggle svg {
+      width: 21px;
+      height: 21px;
+    }
+    #vm-phase2-panel {
+      width: 265px;
+      margin-bottom: 10px;
+      padding: 17px;
+      border: 1px solid #383838;
+      border-radius: 14px;
+      background: #090909;
+      color: #fff;
+      box-shadow: 0 12px 35px #0008;
+    }
+    #vm-phase2-panel[hidden] { display: none; }
+    #vm-phase2-panel strong {
+      display: block;
+      margin-bottom: 4px;
+      font-size: 16px;
+    }
+    #vm-phase2-panel p {
+      color: #aab8ca;
+      font-size: 12px;
+      margin: 0 0 13px;
+    }
+    #vm-phase2-panel a {
+      display: block;
+      margin-top: 9px;
+      padding: 11px 12px;
+      border: 1px solid #292929;
+      border-radius: 8px;
+      background: #151515;
+      color: #fff;
+      text-decoration: none;
+      font-weight: 600;
+      font-size: 13px;
+      transition: background 0.15s ease, color 0.15s ease;
+    }
+    #vm-phase2-panel a:hover {
+      background: #fff;
+      color: #000;
+    }
+    @media(max-width:480px) {
+      #vm-phase2-launcher { right: 12px; bottom: 12px; }
+    }
+  `;
+  document.head.appendChild(style);
+
+  const wrapper = document.createElement("div");
+  wrapper.id = "vm-phase2-launcher";
+
+  wrapper.innerHTML = `
+    <nav id="vm-phase2-panel" hidden aria-label="Phase 2 tools">
+      <strong>VOICEMATRIX Phase 2</strong>
+      <p>Experimental voice-analysis tools</p>
+      <a href="/live-monitor.html">Live Voice Monitor ?</a>
+      <a href="/partial-fake.html">Partial-Fake Detection ?</a>
+    </nav>
+    <button
+      type="button"
+      id="vm-phase2-toggle"
+      aria-expanded="false"
+      aria-controls="vm-phase2-panel"
+      aria-label="Open Phase 2 tools"
+      title="Phase 2 tools">
+      <svg viewBox="0 0 24 24" fill="none"
+        stroke="currentColor" stroke-width="1.7"
+        stroke-linecap="round" aria-hidden="true">
+        <path d="M4 6h16M4 12h16M4 18h16"/>
+        <circle cx="9" cy="6" r="1.5" fill="currentColor" stroke="none"/>
+        <circle cx="15" cy="12" r="1.5" fill="currentColor" stroke="none"/>
+        <circle cx="10" cy="18" r="1.5" fill="currentColor" stroke="none"/>
+      </svg>
+    </button>
+  `;
+
+  document.body.appendChild(wrapper);
+
+  const toggle = document.getElementById("vm-phase2-toggle");
+  const panel = document.getElementById("vm-phase2-panel");
+
+  toggle.addEventListener("click", () => {
+    const opening = panel.hidden;
+    panel.hidden = !opening;
+    toggle.setAttribute("aria-expanded", String(opening));
+  });
+})();
+</script>
+
+
+  
+</body>
+</html>

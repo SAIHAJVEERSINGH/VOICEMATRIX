@@ -1,0 +1,202 @@
+.vm-live-monitor-card,
+.vm-live-monitor-card * {
+  box-sizing: border-box;
+}
+
+.vm-live-monitor-card {
+  width: 100%;
+  max-width: 1280px;
+  margin: 24px auto;
+  padding: clamp(22px, 3vw, 32px);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 28px;
+  color: #f8fbff;
+  background: linear-gradient(115deg, #0b1b3d 0%, #102b5c 100%);
+  border: 1px solid rgba(59, 130, 246, 0.65);
+  border-radius: 18px;
+  box-shadow: 0 12px 32px rgba(0, 20, 70, 0.2);
+}
+
+.vm-live-monitor-card__content {
+  min-width: 0;
+}
+
+.vm-live-monitor-card__eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-bottom: 10px;
+  color: #7dd3fc;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 1.5px;
+}
+
+.vm-live-monitor-card__status-dot {
+  width: 9px;
+  height: 9px;
+  flex: 0 0 9px;
+  border-radius: 50%;
+  background: #38bdf8;
+  box-shadow: 0 0 12px rgba(56, 189, 248, 0.65);
+}
+
+.vm-live-monitor-card h2 {
+  margin: 0 0 10px;
+  color: #ffffff;
+  font-size: clamp(22px, 2.5vw, 30px);
+  line-height: 1.2;
+}
+
+.vm-live-monitor-card__description {
+  max-width: 680px;
+  margin: 0;
+  color: #d4e1f6;
+  font-size: 15px;
+  line-height: 1.7;
+}
+
+.vm-live-monitor-card__tip {
+  margin: 14px 0 0;
+  color: #b8cbe7;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.vm-live-monitor-card__tip strong {
+  color: #fbbf24;
+}
+
+.vm-live-monitor-card__action {
+  display: inline-flex;
+  align-items: center;
+  gap: 13px;
+  min-width: 250px;
+  padding: 16px 18px;
+  color: #ffffff;
+  text-decoration: none;
+  background: #164a91;
+  border: 1px solid #60a5fa;
+  border-radius: 13px;
+  transition: background 160ms ease, transform 160ms ease;
+}
+
+.vm-live-monitor-card__action:hover {
+  background: #1d5eae;
+  transform: translateY(-2px);
+}
+
+.vm-live-monitor-card__mic {
+  font-size: 30px;
+  line-height: 1;
+}
+
+.vm-live-monitor-card__action-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.vm-live-monitor-card__action-copy strong {
+  font-size: 14px;
+}
+
+.vm-live-monitor-card__action-copy small {
+  color: #d4e1f6;
+  font-size: 11px;
+}
+
+.vm-live-monitor-card__arrow {
+  margin-left: auto;
+  color: #7dd3fc;
+  font-size: 22px;
+}
+
+@media (max-width: 720px) {
+  .vm-live-monitor-card {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 20px;
+    padding: 20px;
+  }
+
+  .vm-live-monitor-card__action {
+    width: 100%;
+    min-width: 0;
+  }
+}
+
+/* VOICEMATRIX MONOCHROME OVERRIDES */
+
+.vm-live-monitor-card {
+  color: #ffffff !important;
+  background: #000000 !important;
+  border: 1px solid #ffffff !important;
+  box-shadow: none !important;
+}
+
+.vm-live-monitor-card__eyebrow {
+  color: #d4d4d4 !important;
+}
+
+.vm-live-monitor-card__status-dot {
+  background: #ffffff !important;
+  box-shadow: none !important;
+}
+
+.vm-live-monitor-card h2 {
+  color: #ffffff !important;
+}
+
+.vm-live-monitor-card__description {
+  color: #e5e5e5 !important;
+}
+
+.vm-live-monitor-card__tip {
+  color: #cccccc !important;
+}
+
+.vm-live-monitor-card__tip strong {
+  color: #ffffff !important;
+}
+
+.vm-live-monitor-card__action {
+  color: #000000 !important;
+  background: #ffffff !important;
+  border: 1px solid #ffffff !important;
+  box-shadow: none !important;
+}
+
+.vm-live-monitor-card__action:hover {
+  color: #ffffff !important;
+  background: #222222 !important;
+}
+
+.vm-live-monitor-card__mic {
+  filter: grayscale(1) !important;
+}
+
+.vm-live-monitor-card__action-copy strong,
+.vm-live-monitor-card__action-copy small {
+  color: inherit !important;
+}
+
+.vm-live-monitor-card__arrow {
+  color: inherit !important;
+}
+
+/* Monochrome rules for the standalone Live Monitoring page. */
+#vm-mic-guidance {
+  color: #ffffff !important;
+  background: #000000 !important;
+  border: 1px solid #ffffff !important;
+  border-left: 4px solid #ffffff !important;
+  border-radius: 10px !important;
+  box-shadow: none !important;
+}
+
+#vm-mic-guidance strong,
+#vm-mic-guidance span {
+  color: #ffffff !important;
+}

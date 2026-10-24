@@ -1,0 +1,176 @@
+import numpy as np
+
+from app.services.detector import VoiceDetector
+
+
+SAMPLE_RATE = 16000
+MAX_SECONDS = 10
+SILENCE_SECONDS = 0.25
+
+
+def _verdict(score: float) -> str:
+    if score >= 0.70:
+        return "likely_genuine"
+    if score <= 0.30:
+        return "potentially_synthetic"
+    return "inconclusive"
+
+
+def _add_noise(
+    audio: np.ndarray,
+    snr_db: float,
+    seed: int = 20261024,
+) -> np.ndarray:
+    audio = np.asarray(audio, dtype=np.float32)
+
+    signal_rms = float(
+        np.sqrt(np.mean(audio.astype(np.float64) ** 2))
+    )
+
+    if signal_rms < 1e-8:
+        raise ValueError("Audio signal is too quiet for a noise test.")
+
+    rng = np.random.default_rng(seed)
+    noise = rng.standard_normal(len(audio)).astype(np.float32)
+
+    noise_rms = float(
+        np.sqrt(np.mean(noise.astype(np.float64) ** 2))
+    )
+
+    if noise_rms < 1e-8:
+        raise ValueError("Noise generation failed.")
+
+    target_noise_rms = signal_rms / (10 ** (snr_db / 20))
+    noise *= target_noise_rms / noise_rms
+
+    mixed = audio + noise
+
+    # Apply only a global gain adjustment if needed.
+    # This preserves the intended signal-to-noise ratio.
+    peak = float(np.max(np.abs(mixed)))
+
+    if peak > 0.999:
+        mixed *= 0.999 / peak
+
+    return mixed.astype(np.float32)
+
+
+def run_robustness_scan(
+    audio: np.ndarray,
+    sample_rate: int,
+    detector: VoiceDetector,
+) -> dict:
+    if sample_rate != SAMPLE_RATE:
+        raise ValueError("Audio must be resampled to 16000 Hz.")
+
+    audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+
+    if audio.size == 0 or not np.isfinite(audio).all():
+        raise ValueError("Audio is empty or invalid.")
+
+    if len(audio) / sample_rate > MAX_SECONDS:
+        raise ValueError("Robustness scan supports clips up to 10 seconds.")
+
+    baseline = detector.predict(audio, sample_rate)
+
+    tests = [
+        (
+            "volume_minus_6db",
+            audio * (10 ** (-6 / 20)),
+        ),
+        (
+            "noise_20db_snr",
+            _add_noise(audio, snr_db=20),
+        ),
+    ]
+
+    silence_samples = int(SILENCE_SECONDS * sample_rate)
+
+    if len(audio) + silence_samples <= MAX_SECONDS * sample_rate:
+        silence = np.zeros(silence_samples, dtype=np.float32)
+
+        tests.append(
+            (
+                "leading_silence_250ms",
+                np.concatenate((silence, audio)),
+            )
+        )
+
+    baseline_verdict = _verdict(baseline.score)
+
+    results = [
+        {
+            "condition": "original",
+            "score": baseline.score,
+            "verdict": baseline_verdict,
+            "inference_ms": baseline.inference_ms,
+            "score_change": 0.0,
+            "classification_changed": False,
+        }
+    ]
+
+    for condition, transformed_audio in tests:
+        prediction = detector.predict(
+            transformed_audio,
+            sample_rate,
+        )
+
+        verdict = _verdict(prediction.score)
+
+        results.append(
+            {
+                "condition": condition,
+                "score": prediction.score,
+                "verdict": verdict,
+                "inference_ms": prediction.inference_ms,
+                "score_change": round(
+                    prediction.score - baseline.score,
+                    6,
+                ),
+                "classification_changed": (
+                    verdict != baseline_verdict
+                ),
+            }
+        )
+
+    score_changes = [
+        abs(item["score_change"])
+        for item in results
+        if item["condition"] != "original"
+    ]
+
+    max_score_change = max(score_changes, default=0.0)
+
+    classification_changed = any(
+        item["classification_changed"]
+        for item in results
+        if item["condition"] != "original"
+    )
+
+    # These are provisional diagnostic triggers, not trained thresholds.
+    sensitive = (
+        classification_changed
+        or max_score_change >= 0.10
+    )
+
+    return {
+        "model_name": baseline.model_name,
+        "original_verdict": baseline_verdict,
+        "original_score": baseline.score,
+        "robustness_status": (
+            "sensitive_to_tested_transformations"
+            if sensitive
+            else "stable_under_tested_transformations"
+        ),
+        "max_absolute_score_change": round(
+            max_score_change, 6
+        ),
+        "classification_changed": classification_changed,
+        "results": results,
+        "warning": (
+            "This is a diagnostic stress test, not a calibrated "
+            "confidence score or an accuracy estimate. Stability under "
+            "these transformations does not guarantee generalization "
+            "to unseen voice generators."
+        ),
+    }

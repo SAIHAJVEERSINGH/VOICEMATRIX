@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VOICEMATRIX — Live Voice Monitor</title>
+  <link rel="stylesheet" href="/phase2-theme.css">
+<style id="vm-mic-guidance-theme">
+  #vm-mic-guidance {
+    background: #000 !important;
+    color: #fff !important;
+    border: 1px solid #fff !important;
+    border-left: 4px solid #fff !important;
+    border-radius: 10px !important;
+    box-shadow: none !important;
+  }
+  #vm-mic-guidance strong,
+  #vm-mic-guidance span {
+    color: #fff !important;
+  }
+</style>
+</head>
+<body>
+<main>
+  <div class="brand">VOICEMATRIX / PHASE 2</div>
+  <h1>Live Voice Monitor</h1>
+  <p class="muted">
+    Experimental microphone analysis using the selected Spectra-0 or AASIST-L detector.
+    Scores update on a 500 ms polling schedule when the previous analysis finishes.
+  </p>
+
+  <div id="vm-mic-guidance" role="note"
+     style="margin:0 0 16px;padding:14px 16px;
+            border:1px solid #3b82f6;border-left:4px solid #38bdf8;
+            border-radius:12px;background:#0c1d42;color:#f8fbff;
+            line-height:1.5">
+  <strong style="color:#7dd3fc">🎙️ MICROPHONE TIP</strong><br>
+  <strong>PLEASE KEEP THE SPEAKER CLOSE TO THE MICROPHONE.</strong><br>
+  <span style="color:#cbd5e1">
+    Speak naturally, keep the microphone uncovered, and reduce
+    background noise whenever possible.
+  </span>
+</div>
+<section class="card">
+    <div style="margin-bottom:14px">
+      <label for="model"><strong>Detector model</strong></label><br>
+      <select id="model" style="margin-top:6px;padding:8px;min-width:220px">
+        <option value="spectra" selected>Spectra-0</option>
+        <option value="aasist">AASIST-L</option>
+      </select>
+    </div>
+    <div class="buttons">
+      <button id="start">Start microphone</button>
+      <button id="stop" disabled>Stop monitoring</button>
+    </div>
+    <p id="status" class="muted">Microphone is stopped.</p>
+    <p id="message" class="muted"></p>
+  </section>
+
+  <section class="card">
+    <div class="label">Latest detector verdict</div>
+    <div id="verdict" class="uncertain">Waiting for audio</div>
+
+    <div class="label">Bona-fide model score</div>
+    <div id="score">—</div>
+    <div class="track"><div id="bar"></div></div>
+
+    <p id="timing" class="muted">Analysis has not started.</p>
+
+    <div class="notice">
+      The displayed score is not a calibrated probability or identity
+      verification. Each update analyses a rolling audio recording;
+      the model does not independently verify the speaker's identity.
+      Do not use this result alone to approve payments or sensitive requests.
+    </div>
+  </section>
+
+  <p class="muted"><a href="/">Return to VOICEMATRIX</a></p>
+</main>
+
+<script>
+(() => {
+  const API = "http://127.0.0.1:8000/api";
+  const POLL_MS = 500;
+  const AUDIO_WINDOW_SECONDS = 5.0;
+
+  const $ = id => document.getElementById(id);
+  // VOICEMATRIX rolling-window consensus.
+  const LIVE_MAX_WINDOWS = 4;
+  const LIVE_REQUIRED_AGREEMENT = 3;
+
+  let livePredictionHistory = [];
+  let livePredictionModel = null;
+  let livePredictionLastTime = 0;
+
+  const applyLiveConsensus = (result) => {
+    if (!result || typeof result !== "object") {
+      return result;
+    }
+
+    const score = Number(result.score);
+
+    if (!Number.isFinite(score)) {
+      return result;
+    }
+
+    const validVerdicts = [
+      "likely_genuine",
+      "potentially_synthetic",
+      "inconclusive"
+    ];
+
+    const modelVerdict = validVerdicts.includes(result.verdict)
+      ? result.verdict
+      : "inconclusive";
+
+    const selector = $("model");
+    const model = selector ? selector.value : "default";
+
+    // EXPERIMENTAL SPECTRA SCORE BANDS:
+    // below 0.30 = potentially synthetic
+    // 0.30 to below 0.70 = inconclusive
+    // 0.70 or above = likely genuine
+    // Preserve the backend verdict for AASIST-L.
+    const verdict = model === "spectra"
+      ? (
+          score < 0.30
+            ? "potentially_synthetic"
+            : score >= 0.70
+              ? "likely_genuine"
+              : "inconclusive"
+        )
+      : modelVerdict;
+
+    const now = Date.now();
+
+    // Clear history when the model changes or monitoring pauses.
+    if (
+      model !== livePredictionModel ||
+      (
+        livePredictionLastTime > 0 &&
+        now - livePredictionLastTime > 20000
+      )
+    ) {
+      livePredictionHistory = [];
+      livePredictionModel = model;
+    }
+
+    livePredictionLastTime = now;
+
+    // Store the ORIGINAL individual model prediction.
+    livePredictionHistory.push({
+      verdict: verdict,
+      score: score,
+      time: now
+    });
+
+    // Retain only the latest four predictions.
+    if (livePredictionHistory.length > LIVE_MAX_WINDOWS) {
+      livePredictionHistory.shift();
+    }
+
+    const total = livePredictionHistory.length;
+
+    const syntheticCount = livePredictionHistory.filter(
+      item => item.verdict === "potentially_synthetic"
+    ).length;
+
+    const genuineCount = livePredictionHistory.filter(
+      item => item.verdict === "likely_genuine"
+    ).length;
+
+    let finalVerdict;
+    let consensusMessage;
+
+    if (
+      total >= LIVE_REQUIRED_AGREEMENT &&
+      syntheticCount >= LIVE_REQUIRED_AGREEMENT
+    ) {
+      finalVerdict = "potentially_synthetic";
+      consensusMessage =
+        syntheticCount + " of " + total +
+        " recent predictions indicate potentially synthetic speech.";
+
+    } else if (
+      total >= LIVE_REQUIRED_AGREEMENT &&
+      genuineCount >= LIVE_REQUIRED_AGREEMENT
+    ) {
+      finalVerdict = "likely_genuine";
+      consensusMessage =
+        genuineCount + " of " + total +
+        " recent predictions indicate likely genuine speech.";
+
+    } else if (total >= LIVE_REQUIRED_AGREEMENT) {
+      finalVerdict = "inconclusive";
+      consensusMessage =
+        "Recent predictions disagree. Continue monitoring.";
+
+    } else {
+      // Do not wait for all four results to show an initial assessment.
+      finalVerdict = verdict;
+      consensusMessage =
+        "Preliminary result: " + total + " of 3 required predictions collected.";
+    }
+
+    // Use the median score to reduce abrupt display fluctuations.
+    // This does not recalibrate the underlying model score.
+    const sortedScores = livePredictionHistory
+      .map(item => item.score)
+      .sort((a, b) => a - b);
+
+    const middle = Math.floor(sortedScores.length / 2);
+
+    const medianScore = sortedScores.length % 2 === 0
+      ? (sortedScores[middle - 1] + sortedScores[middle]) / 2
+      : sortedScores[middle];
+
+    // Update the result used by the existing display function.
+    result.verdict = finalVerdict;
+    result.score = medianScore;
+
+    result.explanation = [
+      result.explanation || "",
+      "Live monitoring: " + consensusMessage,
+      "Latest individual prediction: " + verdict + "."
+    ].filter(Boolean).join(" ");
+
+    const warnings = Array.isArray(result.warnings)
+      ? result.warnings.slice()
+      : [];
+
+    warnings.push("LIVE WINDOW ANALYSIS: " + consensusMessage);
+
+    warnings.push(
+      "Overlapping predictions may be correlated. Consensus " +
+      "stabilises the displayed assessment but does not guarantee " +
+      "higher detection accuracy."
+    );
+
+    result.warnings = warnings;
+
+    return result;
+  };
+
+  const startButton = $("start");
+  const stopButton = $("stop");
+
+  let stream = null;
+  let context = null;
+  let source = null;
+  let processor = null;
+  let chunks = [];
+  let totalSamples = 0;
+  let timer = null;
+  let running = false;
+  let busy = false;
+
+  function setStatus(text) {
+    $("status").textContent = text;
+  }
+
+  function setMessage(text) {
+    $("message").textContent = text || "";
+  }
+
+  function trimBuffer() {
+    if (!context) return;
+
+    const maxSamples = Math.floor(
+      context.sampleRate * AUDIO_WINDOW_SECONDS
+    );
+
+    while (totalSamples > maxSamples && chunks.length > 0) {
+      const excess = totalSamples - maxSamples;
+
+      if (chunks[0].length <= excess) {
+        totalSamples -= chunks[0].length;
+        chunks.shift();
+      } else {
+        chunks[0] = chunks[0].slice(excess);
+        totalSamples -= excess;
+      }
+    }
+  }
+
+  function createWav(samples, sampleRate) {
+    const buffer = new ArrayBuffer(44 + samples.length * 2);
+    const view = new DataView(buffer);
+
+    view.setUint32(0, 0x46464952, true);
+    view.setUint32(4, 36 + samples.length * 2, true);
+    view.setUint32(8, 0x45564157, true);
+    view.setUint32(12, 0x20746d66, true);
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    view.setUint32(36, 0x61746164, true);
+    view.setUint32(40, samples.length * 2, true);
+
+    let offset = 44;
+
+    for (let i = 0; i < samples.length; i++) {
+      const s = Math.max(-1, Math.min(1, samples[i]));
+      view.setInt16(
+        offset,
+        s < 0 ? s * 32768 : s * 32767,
+        true
+      );
+      offset += 2;
+    }
+
+    return new Blob([buffer], { type: "audio/wav" });
+  }
+
+  function getRecentAudio() {
+    const all = new Float32Array(totalSamples);
+    let offset = 0;
+
+    for (const chunk of chunks) {
+      all.set(chunk, offset);
+      offset += chunk.length;
+    }
+
+    return all;
+  }
+
+  function displayResult(result, elapsedMs) {
+    const verdict = result.verdict || "inconclusive";
+    const labels = {
+      likely_genuine: ["Likely genuine", "genuine"],
+      potentially_synthetic: ["Potentially synthetic", "synthetic"],
+      inconclusive: ["Inconclusive", "uncertain"]
+    };
+
+    const display = labels[verdict] || ["Unknown", "uncertain"];
+
+    $("verdict").textContent = display[0];
+    $("verdict").className = display[1];
+
+    const score = Number(result.score);
+
+    if (Number.isFinite(score)) {
+      const percent = Math.max(0, Math.min(100, score * 100));
+      $("score").textContent = percent.toFixed(2) + " / 100";
+      $("bar").style.width = percent + "%";
+      $("bar").style.background =
+        verdict === "potentially_synthetic" ? "#ff8585" :
+        verdict === "likely_genuine" ? "#75e6c0" : "#ffd27d";
+    } else {
+      $("score").textContent = "Unavailable";
+      $("bar").style.width = "0%";
+    }
+
+    const serverMs = Number(result.inference_ms);
+    $("timing").textContent =
+      "Request round trip: " + Math.round(elapsedMs) + " ms" +
+      (Number.isFinite(serverMs) ? " | Model inference: " +
+        Math.round(serverMs) + " ms" : "");
+
+    const warnings = Array.isArray(result.warnings)
+      ? result.warnings.join("\n")
+      : "";
+
+    setMessage(warnings);
+  }
+
+  async function scanLatest() {
+    if (!running || busy || !context) return;
+
+    const minimumSamples = Math.floor(context.sampleRate * 4.1);
+    if (totalSamples < minimumSamples) {
+      setStatus("Listening — collecting enough audio for the first analysis.");
+      return;
+    }
+
+    busy = true;
+
+    const started = performance.now();
+
+    try {
+      const recent = getRecentAudio();
+
+      const wav = createWav(recent, context.sampleRate);
+      const form = new FormData();
+      form.append("file", wav, "live_voice_window.wav");
+
+      const endpoint = $("model").value === "spectra" ? "/analyze-spectra" : "/analyze";
+      const response = await fetch(API + endpoint, {
+        method: "POST",
+        body: form
+      });
+
+      if (!response.ok) {
+        const detail = await response.text();
+        throw new Error(
+          "API returned HTTP " + response.status + ": " +
+          detail.slice(0, 250)
+        );
+      }
+
+      const result = await response.json();
+      applyLiveConsensus(result);
+
+      if (running) {
+        displayResult(result, performance.now() - started);
+        setStatus(
+          "Monitoring live audio. Next analysis is scheduled every 500 ms."
+        );
+      }
+    } catch (error) {
+      setStatus("Analysis request failed.");
+      setMessage(
+        String(error) +
+        "\nCheck that the backend is running and allows frontend CORS requests."
+      );
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function stopMonitoring() {
+    running = false;
+
+    if (timer !== null) {
+      clearInterval(timer);
+      timer = null;
+    }
+
+    if (processor) {
+      processor.onaudioprocess = null;
+      processor.disconnect();
+      processor = null;
+    }
+
+    if (source) {
+      source.disconnect();
+      source = null;
+    }
+
+    if (stream) {
+      stream.getTracks().forEach(track => track.stop());
+      stream = null;
+    }
+
+    if (context) {
+      await context.close().catch(() => {});
+      context = null;
+    }
+
+    chunks = [];
+    totalSamples = 0;
+    busy = false;
+
+    startButton.disabled = false;
+    stopButton.disabled = true;
+    setStatus("Microphone stopped.");
+  }
+
+  startButton.addEventListener("click", async () => {
+    startButton.disabled = true;
+    setMessage("");
+
+    try {
+      const healthPath = $("model").value === "spectra" ? "/spectra-health" : "/health";
+      const health = await fetch(API + healthPath);
+
+      if (!health.ok) {
+        throw new Error("Backend health check failed.");
+      }
+
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false
+        }
+      });
+
+      context = new (window.AudioContext || window.webkitAudioContext)();
+      await context.resume();
+
+      source = context.createMediaStreamSource(stream);
+      processor = context.createScriptProcessor(4096, 1, 1);
+
+      processor.onaudioprocess = event => {
+        const input = event.inputBuffer.getChannelData(0);
+        const copy = new Float32Array(input);
+
+        chunks.push(copy);
+        totalSamples += copy.length;
+        trimBuffer();
+
+        const output = event.outputBuffer;
+        for (let ch = 0; ch < output.numberOfChannels; ch++) {
+          output.getChannelData(ch).fill(0);
+        }
+      };
+
+      source.connect(processor);
+      processor.connect(context.destination);
+
+      running = true;
+      stopButton.disabled = false;
+
+      setStatus("Listening. The first result appears after enough audio is collected.");
+      setMessage("Microphone audio is sent to your local VOICEMATRIX backend for analysis.");
+
+      timer = setInterval(scanLatest, POLL_MS);
+    } catch (error) {
+      await stopMonitoring();
+      setStatus("Could not start microphone monitoring.");
+      setMessage(String(error));
+    } finally {
+      startButton.disabled = false;
+    }
+  });
+
+  stopButton.addEventListener("click", stopMonitoring);
+})();
+</script>
+</body>
+</html>

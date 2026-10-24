@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VOICEMATRIX — Partial-Fake Detection</title>
+<link rel="stylesheet" href="/phase2-theme.css">
+</head>
+<body>
+<main>
+  <div class="brand">VOICEMATRIX / PHASE 2</div>
+  <h1>Partial-Fake Voice Detection</h1>
+  <p class="muted">
+    Scan an audio recording with the selected Spectra-0 or AASIST-L detector.
+    Review detector scores across overlapping time windows.
+  </p>
+
+  <section class="card">
+    <div style="margin:12px 0">
+      <label for="model"><strong>Detector model</strong></label><br>
+      <select id="model" style="margin-top:6px;padding:8px;min-width:220px">
+        <option value="spectra" selected>Spectra-0</option>
+        <option value="aasist">AASIST-L</option>
+      </select>
+    </div>
+    <label for="audio"><strong>Select an audio recording</strong></label><br>
+    <input id="audio" type="file" accept="audio/*"><br>
+    <button id="scan">Scan Recording</button>
+    <p id="status" class="muted">Waiting for a recording.</p>
+    <progress id="progress" value="0" max="100" hidden></progress>
+    <div class="notice">
+      Experimental feature. Each score uses approximately 4.04 seconds
+      of audio. Windows advance by 0.5 seconds, but this does not mean
+      the model can locate fake speech with 0.5-second precision.
+      Model scores are not calibrated probabilities.
+    </div>
+  </section>
+
+  <section class="card" id="results" hidden>
+    <h2>Scan Results</h2>
+    <div class="summary">
+      <div class="metric">
+        <strong id="total">0</strong>
+        <span>Windows analysed</span>
+      </div>
+      <div class="metric">
+        <strong id="suspect">0</strong>
+        <span>Potentially synthetic windows</span>
+      </div>
+      <div class="metric">
+        <strong id="inconclusive">0</strong>
+        <span>Inconclusive windows</span>
+      </div>
+    </div>
+
+    <h3>Time-window analysis</h3>
+    <p class="muted">
+      Red indicates a potentially synthetic verdict. Green indicates a
+      likely-genuine verdict. Amber indicates an inconclusive result.
+    </p>
+    <div id="timeline"></div>
+  </section>
+
+  <p class="muted"><a href="/">Back to VOICEMATRIX</a></p>
+</main>
+
+<script>
+(() => {
+  const API = "http://127.0.0.1:8000/api";
+  const WINDOW_SECONDS = 64600 / 16000;
+  const HOP_SECONDS = 0.5;
+
+  const $ = id => document.getElementById(id);
+  const button = $("scan");
+  let running = false;
+
+  function makeWav(samples, sampleRate) {
+    const buffer = new ArrayBuffer(44 + samples.length * 2);
+    const view = new DataView(buffer);
+
+    view.setUint32(0, 0x46464952, true);
+    view.setUint32(4, 36 + samples.length * 2, true);
+    view.setUint32(8, 0x45564157, true);
+    view.setUint32(12, 0x20746d66, true);
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    view.setUint32(36, 0x61746164, true);
+    view.setUint32(40, samples.length * 2, true);
+
+    let offset = 44;
+    for (let i = 0; i < samples.length; i++) {
+      const sample = Math.max(-1, Math.min(1, samples[i]));
+      view.setInt16(
+        offset,
+        sample < 0 ? sample * 32768 : sample * 32767,
+        true
+      );
+      offset += 2;
+    }
+
+    return new Blob([buffer], {type: "audio/wav"});
+  }
+
+  function renderRows(rows) {
+    $("timeline").replaceChildren();
+
+    for (const row of rows) {
+      const verdict = row.verdict;
+      const element = document.createElement("div");
+
+      element.className = "timeline-row " +
+        (verdict === "potentially_synthetic" ? "flagged" :
+         verdict === "likely_genuine" ? "genuine" : "");
+
+      const title = document.createElement("div");
+      title.className = "window-title";
+
+      const time = document.createElement("strong");
+      time.textContent =
+        row.start.toFixed(2) + "s – " + row.end.toFixed(2) + "s";
+
+      const label = document.createElement("span");
+      label.textContent =
+        verdict === "potentially_synthetic" ? "Potentially synthetic" :
+        verdict === "likely_genuine" ? "Likely genuine" : "Inconclusive";
+
+      title.append(time, label);
+
+      const score = document.createElement("div");
+      score.textContent =
+        "Bona-fide model score: " + (row.score * 100).toFixed(2) + "/100";
+
+      const track = document.createElement("div");
+      track.className = "scorebar";
+
+      const fill = document.createElement("div");
+      fill.className = "scorefill";
+      fill.style.width =
+        (Math.max(0, Math.min(1, row.score)) * 100) + "%";
+
+      track.append(fill);
+      element.append(title, score, track);
+      $("timeline").append(element);
+    }
+  }
+
+  async function scan() {
+    if (running) return;
+
+    const file = $("audio").files[0];
+
+    if (!file) {
+      $("status").textContent = "Please choose an audio file first.";
+      return;
+    }
+
+    running = true;
+    button.disabled = true;
+    $("results").hidden = true;
+    $("progress").hidden = false;
+    $("progress").value = 0;
+    $("timeline").replaceChildren();
+
+    let audioContext;
+
+    try {
+      const healthPath = $("model").value === "spectra" ? "/spectra-health" : "/health";
+      const health = await fetch(API + healthPath);
+      if (!health.ok) throw new Error("Backend health check failed.");
+
+      audioContext = new (window.AudioContext || window.webkitAudioContext)();
+
+      const decoded = await audioContext.decodeAudioData(
+        await file.arrayBuffer()
+      );
+
+      const sampleRate = decoded.sampleRate;
+      const duration = decoded.duration;
+      const sourceLength = decoded.length;
+
+      if (duration < 2) {
+        throw new Error(
+          "Recording must be at least 2 seconds long."
+        );
+      }
+
+      // Mix channels into mono without altering the original file.
+      const mono = new Float32Array(sourceLength);
+
+      for (let channel = 0; channel < decoded.numberOfChannels; channel++) {
+        const samples = decoded.getChannelData(channel);
+        for (let i = 0; i < sourceLength; i++) {
+          mono[i] += samples[i] / decoded.numberOfChannels;
+        }
+      }
+
+      const windowLength = Math.ceil(WINDOW_SECONDS * sampleRate);
+      const hopLength = Math.max(
+        1, Math.round(HOP_SECONDS * sampleRate)
+      );
+
+      const starts = [];
+
+      if (sourceLength <= windowLength) {
+        starts.push(0);
+      } else {
+        for (let start = 0; start + windowLength <= sourceLength;
+             start += hopLength) {
+          starts.push(start);
+        }
+
+        const finalStart = sourceLength - windowLength;
+        if (starts[starts.length - 1] !== finalStart) {
+          starts.push(finalStart);
+        }
+      }
+
+      const results = [];
+      let syntheticCount = 0;
+      let inconclusiveCount = 0;
+
+      for (let i = 0; i < starts.length; i++) {
+        const start = starts[i];
+        const end = Math.min(start + windowLength, sourceLength);
+
+        // Short recordings are padded to the detector's input window.
+        const window = new Float32Array(windowLength);
+        window.set(mono.subarray(start, end));
+
+        const wav = makeWav(window, sampleRate);
+        const form = new FormData();
+        form.append("file", wav, "partial_window.wav");
+
+        $("status").textContent =
+          "Analysing window " + (i + 1) + " of " + starts.length + "...";
+        $("progress").value = ((i + 1) / starts.length) * 100;
+
+        const endpoint = $("model").value === "spectra" ? "/analyze-spectra" : "/analyze";
+        const response = await fetch(API + endpoint, {
+          method: "POST",
+          body: form
+        });
+
+        if (!response.ok) {
+          throw new Error(
+            "Analysis failed (HTTP " + response.status + "): " +
+            (await response.text()).slice(0, 250)
+          );
+        }
+
+        const output = await response.json();
+        const score = Number(output.score);
+
+        if (!Number.isFinite(score)) {
+          throw new Error("Detector returned an invalid score.");
+        }
+
+        const verdict = output.verdict || "inconclusive";
+
+        results.push({
+          start: start / sampleRate,
+          end: Math.min(
+            start / sampleRate + WINDOW_SECONDS,
+            duration
+          ),
+          score,
+          verdict
+        });
+
+        if (verdict === "potentially_synthetic") syntheticCount++;
+        if (verdict === "inconclusive") inconclusiveCount++;
+      }
+
+      renderRows(results);
+
+      $("total").textContent = results.length;
+      $("suspect").textContent = syntheticCount;
+      $("inconclusive").textContent = inconclusiveCount;
+      $("results").hidden = false;
+
+      $("status").textContent =
+        "Analysis completed. Review the flagged windows below.";
+
+    } catch (error) {
+      $("status").textContent = "Scan could not be completed:\n" + error;
+    } finally {
+      if (audioContext) await audioContext.close().catch(() => {});
+      running = false;
+      button.disabled = false;
+    }
+  }
+
+  button.addEventListener("click", scan);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,921 @@
+import { useEffect, useRef, useState } from "react";
+import {
+  Activity,
+  ArrowDownToLine,
+  ArrowRight,
+  AudioLines,
+  Check,
+  ChevronRight,
+  CircleAlert,
+  Clock3,
+  FileAudio,
+  Info,
+  LockKeyhole,
+  RotateCcw,
+  ShieldCheck,
+  Upload,
+  X
+} from "lucide-react";
+
+import {
+  analyzeAudio,
+  checkHealth,
+  getScamGuidance,
+  runRobustnessScan
+} from "./services/api";
+
+const initialAnswers = {
+  urgent_money_request: false,
+  asks_for_otp_or_pin: false,
+  caller_claims_emergency: false
+};
+
+const verdicts = {
+  likely_genuine: {
+    title: "Likely genuine",
+    description: "The model score supports genuine speech. This does not verify the speaker's identity.",
+    marker: "A"
+  },
+  potentially_synthetic: {
+    title: "Potentially synthetic",
+    description: "The model output indicates possible spoofed speech. Verify the source independently.",
+    marker: "B"
+  },
+  inconclusive: {
+    title: "Inconclusive",
+    description: "The score falls between the current decision thresholds.",
+    marker: "—"
+  }
+};
+
+function formatSize(bytes) {
+  if (bytes < 1024) return `${bytes} bytes`;
+  if (bytes < 1048576) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1048576).toFixed(2)} MB`;
+}
+
+function formatTime(value) {
+  if (!Number.isFinite(value)) return "—";
+  return value < 1000
+    ? `${value.toFixed(0)} ms`
+    : `${(value / 1000).toFixed(2)} s`;
+}
+
+function reliabilityLabel(value) {
+  const labels = {
+    experimental: "Initial checks passed",
+    limited: "Use caution",
+    insufficient_data: "Insufficient data"
+  };
+  return labels[value] || "Not available";
+}
+
+function readableCondition(value) {
+  const labels = {
+    original: "Original audio",
+    volume_minus_6db: "Volume reduced by 6 dB",
+    noise_20db_snr: "Added noise (20 dB SNR)",
+    leading_silence_250ms: "250 ms leading silence"
+  };
+
+  return labels[value] || String(value || "Unknown test").replaceAll("_", " ");
+}
+
+function App() {
+  const fileInput = useRef(null);
+
+  const [file, setFile] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [dragging, setDragging] = useState(false);
+  const [result, setResult] = useState(null);
+  const [robustness, setRobustness] = useState(null);
+  const [robustnessBusy, setRobustnessBusy] = useState(false);
+  const [robustnessError, setRobustnessError] = useState("");
+  const [error, setError] = useState("");
+  const [online, setOnline] = useState(false);
+
+  const [answers, setAnswers] = useState(initialAnswers);
+  const [guidance, setGuidance] = useState([]);
+  const [guidanceBusy, setGuidanceBusy] = useState(false);
+  const [guidanceError, setGuidanceError] = useState("");
+
+  useEffect(() => {
+    let active = true;
+
+    async function refreshStatus() {
+      try {
+        const health = await checkHealth();
+        if (active) {
+          setOnline(health.status === "ok" && health.detector_ready === true);
+        }
+      } catch {
+        if (active) setOnline(false);
+      }
+    }
+
+    refreshStatus();
+    const timer = window.setInterval(refreshStatus, 10000);
+
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  function selectFile(candidate) {
+    setError("");
+    setResult(null);
+    setRobustness(null);
+    setRobustnessError("");
+
+    if (!candidate) return;
+
+    const supported =
+      /\.(wav|flac|mp3|ogg|aiff|aif|m4a|mp4|wma|webm)$/i.test(candidate.name);
+
+    if (!supported) {
+      setFile(null);
+      setError("Choose a supported audio file, such as WAV, FLAC or MP3.");
+      return;
+    }
+
+    if (candidate.size === 0) {
+      setFile(null);
+      setError("The selected file is empty.");
+      return;
+    }
+
+    if (candidate.size > 15 * 1024 * 1024) {
+      setFile(null);
+      setError("The maximum upload size is 15 MB.");
+      return;
+    }
+
+    setFile(candidate);
+  }
+
+  async function runAnalysis(event) {
+    event.preventDefault();
+
+    if (!file || busy) return;
+
+    setBusy(true);
+    setError("");
+    setResult(null);
+    setRobustness(null);
+    setRobustnessError("");
+
+    try {
+      const data = await analyzeAudio(file);
+      setResult(data);
+    } catch (err) {
+      setError(err.message || "Analysis failed. Check the server connection.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleRobustnessScan() {
+    if (!file || robustnessBusy) return;
+
+    setRobustnessBusy(true);
+    setRobustnessError("");
+    setRobustness(null);
+
+    try {
+      const data = await runRobustnessScan(file);
+      setRobustness(data);
+    } catch (err) {
+      setRobustnessError(
+        err.message || "Robustness analysis failed. Please try again."
+      );
+    } finally {
+      setRobustnessBusy(false);
+    }
+  }
+
+  async function requestGuidance(event) {
+    event.preventDefault();
+
+    setGuidanceBusy(true);
+    setGuidanceError("");
+    setGuidance([]);
+
+    try {
+      const data = await getScamGuidance(answers);
+      setGuidance(data.recommendations || []);
+    } catch (err) {
+      setGuidanceError(err.message || "Could not retrieve recommendations.");
+    } finally {
+      setGuidanceBusy(false);
+    }
+  }
+
+  function toggleAnswer(key) {
+    setAnswers(current => ({
+      ...current,
+      [key]: !current[key]
+    }));
+  }
+
+  function resetAnalysis() {
+    setFile(null);
+    setResult(null);
+    setError("");
+
+    if (fileInput.current) {
+      fileInput.current.value = "";
+    }
+  }
+
+  function exportReport() {
+    if (!result) return;
+
+    const report = {
+      file_name: file?.name || null,
+      generated_at: new Date().toISOString(),
+      ...result
+    };
+
+    const blob = new Blob(
+      [JSON.stringify(report, null, 2)],
+      { type: "application/json" }
+    );
+
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+
+    anchor.href = url;
+    anchor.download = "voicematrix-report.json";
+    anchor.click();
+
+    URL.revokeObjectURL(url);
+  }
+
+  const verdict = result ? verdicts[result.verdict] : null;
+  const score = Number.isFinite(result?.score) ? result.score : null;
+
+  return (
+    <div className="app-shell">
+      <header className="topbar">
+        <a href="#" className="brand" aria-label="VOICEMATRIX home">
+          <span className="brand-mark">VM</span>
+          <span className="brand-name">VOICEMATRIX</span>
+        </a>
+
+        <nav className="top-nav" aria-label="Main navigation">
+          <a className="active" href="#analysis">Analysis</a>
+          <a href="#safety">Call safety</a>
+        </nav>
+
+        <div className={`connection-status ${online ? "online" : ""}`}>
+          <span className="status-dot" />
+          {online ? "System connected" : "System offline"}
+        </div>
+      </header>
+
+      <main className="page-content">
+        <section className="page-intro">
+          <div>
+            <div className="breadcrumb">VOICE SECURITY <span>/</span> WORKSPACE</div>
+            <h1>Audio analysis</h1>
+            <p>
+              Examine a voice recording for signs of synthetic speech.
+            </p>
+          </div>
+
+          <div className="engine-label">
+            <span className="engine-indicator" />
+            AASIST-L <span className="engine-divider">/</span> ONNX
+          </div>
+        </section>
+
+        <section className="analysis-layout" id="analysis">
+          <form className="workspace-panel input-panel" onSubmit={runAnalysis}>
+            <div className="panel-heading">
+              <div>
+                <div className="overline">01 — INPUT</div>
+                <h2>Recording</h2>
+              </div>
+
+              {file && (
+                <button
+                  type="button"
+                  className="icon-button"
+                  onClick={resetAnalysis}
+                  aria-label="Clear selected recording"
+                  title="Clear recording"
+                >
+                  <X size={16} />
+                </button>
+              )}
+            </div>
+
+            <input
+              ref={fileInput}
+              className="visually-hidden"
+              type="file"
+              accept=".wav,.flac,.mp3,.ogg,.aiff,.aif,.m4a,.mp4,.wma,.webm,audio/*"
+              onChange={event => selectFile(event.target.files?.[0])}
+            />
+
+            <button
+              type="button"
+              className={`file-dropzone ${dragging ? "dragging" : ""} ${file ? "file-selected" : ""}`}
+              onClick={() => fileInput.current?.click()}
+              onDragOver={event => {
+                event.preventDefault();
+                setDragging(true);
+              }}
+              onDragLeave={() => setDragging(false)}
+              onDrop={event => {
+                event.preventDefault();
+                setDragging(false);
+                selectFile(event.dataTransfer.files?.[0]);
+              }}
+            >
+              {file ? (
+                <>
+                  <FileAudio size={25} strokeWidth={1.5} />
+                  <strong className="filename">{file.name}</strong>
+                  <span>{formatSize(file.size)}</span>
+                  <span className="file-action">Choose a different file</span>
+                </>
+              ) : (
+                <>
+                  <Upload size={23} strokeWidth={1.5} />
+                  <strong>Select an audio file</strong>
+                  <span>Drop a recording here or browse your device</span>
+                  <span className="file-action">Browse files <ArrowRight size={13} /></span>
+                </>
+              )}
+            </button>
+
+            <div className="input-details">
+              <div>
+                <span>FORMATS</span>
+                <strong>WAV, FLAC, MP3</strong>
+              </div>
+              <div>
+                <span>MAXIMUM SIZE</span>
+                <strong>15 MB</strong>
+              </div>
+              <div>
+                <span>SUPPORTED LENGTH</span>
+                <strong>2?10 seconds</strong>
+              </div>
+            </div>
+
+            {error && (
+              <div className="inline-error" role="alert">
+                <CircleAlert size={16} />
+                <span>{error}</span>
+              </div>
+            )}
+
+            <button
+              type="submit"
+              className="button button-primary analyze-button"
+              disabled={!file || busy || !online}
+            >
+              {busy ? (
+                <>
+                  <span className="spinner" />
+                  Analyzing recording
+                </>
+              ) : (
+                <>
+                  Analyze recording
+                  <ArrowRight size={16} />
+                </>
+              )}
+            </button>
+
+            {!online && (
+              <p className="connection-note">
+                Start the backend server to enable audio analysis.
+              </p>
+            )}
+
+            <div className="privacy-note">
+              <LockKeyhole size={14} />
+              <span>
+                Recordings are processed by the backend. The current analysis
+                endpoint does not intentionally save uploaded audio to disk.
+              </span>
+            </div>
+          </form>
+
+          <section className="workspace-panel report-panel" aria-live="polite">
+            <div className="panel-heading">
+              <div>
+                <div className="overline">02 — REPORT</div>
+                <h2>Analysis result</h2>
+              </div>
+
+              {result && (
+                <button
+                  type="button"
+                  className="text-action"
+                  onClick={exportReport}
+                >
+                  <ArrowDownToLine size={14} />
+                  Export
+                </button>
+              )}
+            </div>
+
+            {!result && !busy && (
+              <div className="report-empty">
+                <AudioLines size={29} strokeWidth={1.3} />
+                <h3>No analysis available</h3>
+                <p>
+                  Select a recording to view the detector's result and
+                  performance details.
+                </p>
+                <div className="empty-meta">
+                  <span>MODEL</span>
+                  <strong>AASIST-L</strong>
+                </div>
+                <div className="empty-meta">
+                  <span>OUTPUT</span>
+                  <strong>Detection score and verdict</strong>
+                </div>
+              </div>
+            )}
+
+            {busy && (
+              <div className="report-empty loading-state">
+                <span className="spinner large-spinner" />
+                <h3>Processing audio</h3>
+                <p>The model is analyzing the recording.</p>
+                <div className="loading-line"><span /></div>
+              </div>
+            )}
+
+            {result && verdict && (
+              <div className="report-content">
+                <div className="result-label">DETECTOR VERDICT</div>
+
+                <div className="verdict-row">
+                  <div>
+                    <h3>{verdict.title}</h3>
+                    <p>{verdict.description}</p>
+                  </div>
+                  <span className="verdict-marker">{verdict.marker}</span>
+                </div>
+
+                <div className="score-block">
+                  <div className="score-heading">
+                    <span>BONA-FIDE SCORE</span>
+                    <strong>
+                      {score === null ? "—" : (score * 100).toFixed(2)}
+                      <small> / 100</small>
+                    </strong>
+                  </div>
+
+                  <div
+                    className="score-track"
+                    role="img"
+                    aria-label={
+                      score === null
+                        ? "Score unavailable"
+                        : `Normalized bona-fide score ${(score * 100).toFixed(2)} out of 100`
+                    }
+                  >
+                    <span
+                      className="score-fill"
+                      style={{ width: `${score === null ? 0 : Math.max(0, Math.min(100, score * 100))}%` }}
+                    />
+                    <span className="threshold threshold-low" />
+                    <span className="threshold threshold-high" />
+                  </div>
+
+                  <div className="score-scale">
+                    <span>0 — Spoof-like</span>
+                    <span>Genuine-like — 100</span>
+                  </div>
+
+                  <p className="score-note">
+                    This is a normalized model score, not a probability.
+                  </p>
+                </div>
+
+                <div className="report-metrics">
+                  <div>
+                    <span>INFERENCE TIME</span>
+                    <strong>{formatTime(Number(result.inference_ms))}</strong>
+                  </div>
+                  <div>
+                    <span>AUDIO LENGTH</span>
+                    <strong>{Number(result.duration_seconds).toFixed(2)} s</strong>
+                  </div>
+                  <div>
+                    <span>WINDOWS ANALYZED</span>
+                    <strong>{result.window_count ?? "—"}</strong>
+                  </div>
+                </div>
+
+                <div className="reliability-row">
+                  <div className="reliability-icon">
+                    <ShieldCheck size={17} strokeWidth={1.5} />
+                  </div>
+                  <div className="reliability-copy">
+                    <span>RELIABILITY CHECK</span>
+                    <strong>{reliabilityLabel(result.reliability)}</strong>
+                  </div>
+                  <span className="reliability-value">
+                    {String(result.reliability || "unknown").replaceAll("_", " ")}
+                  </span>
+                </div>
+
+                <div className="quality-details">
+                  <div className="quality-details-heading">
+                    <strong>Audio-quality checks</strong>
+                    <span>
+                      {Array.isArray(result.quality_reasons) &&
+                      result.quality_reasons.length > 0
+                        ? `${result.quality_reasons.length} warning(s)`
+                        : "No specific quality warning"}
+                    </span>
+                  </div>
+
+                  {Array.isArray(result.quality_reasons) &&
+                  result.quality_reasons.length > 0 ? (
+                    <ul className="quality-reason-list">
+                      {result.quality_reasons.map((reason, index) => (
+                        <li key={`${index}-${reason}`}>{reason}</li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p>
+                      Basic signal checks did not identify a specific issue.
+                      This does not prove that the recording is genuine or
+                      free from noise.
+                    </p>
+                  )}
+
+                  <div className="quality-metric-grid">
+                    {result.clipping_fraction != null && (
+                      <div>
+                        <span>Clipping</span>
+                        <strong>
+                          {(Number(result.clipping_fraction) * 100).toFixed(3)}%
+                        </strong>
+                      </div>
+                    )}
+
+                    {result.near_silent_frame_fraction != null && (
+                      <div>
+                        <span>Near-silent frames</span>
+                        <strong>
+                          {(Number(result.near_silent_frame_fraction) * 100).toFixed(2)}%
+                        </strong>
+                      </div>
+                    )}
+
+                    {result.peak_amplitude != null && (
+                      <div>
+                        <span>Peak amplitude</span>
+                        <strong>
+                          {Number(result.peak_amplitude).toFixed(4)}
+                        </strong>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {result.window_score_range != null && (
+                  <div className="detail-row">
+                    <span>Score variation across windows</span>
+                    <strong>
+                      {(result.window_score_range * 100).toFixed(2)} points
+                    </strong>
+                  </div>
+                )}
+
+                <div className="report-warning">
+                  <Info size={15} />
+                  <p>{result.warning}</p>
+                </div>
+
+                <section
+                  className="robustness-card"
+                  aria-labelledby="robustness-heading"
+                >
+                  <div className="robustness-heading-row">
+                    <div>
+                      <span className="result-label">ROBUSTNESS CHECK</span>
+                      <h4 id="robustness-heading">Prediction stability</h4>
+                      <p>
+                        Test whether controlled audio changes affect the
+                        detector's output.
+                      </p>
+                    </div>
+
+                    <button
+                      type="button"
+                      className="robustness-button"
+                      onClick={handleRobustnessScan}
+                      disabled={robustnessBusy || !file}
+                    >
+                      {robustnessBusy
+                        ? "Running tests..."
+                        : robustness
+                          ? "Run scan again"
+                          : "Run robustness scan"}
+                    </button>
+                  </div>
+
+                  {robustnessError && (
+                    <div className="robustness-error" role="alert">
+                      {robustnessError}
+                    </div>
+                  )}
+
+                  {robustness && (
+                    <div className="robustness-results" aria-live="polite">
+                      <div
+                        className={`robustness-status ${
+                          robustness.robustness_status || ""
+                        }`}
+                      >
+                        <strong>
+                          {robustness.robustness_status ===
+                          "stable_under_tested_transformations"
+                            ? "Stable under tested transformations"
+                            : "Sensitive to tested transformations"}
+                        </strong>
+                        <span>
+                          Maximum absolute score change:{" "}
+                          {(Number(robustness.max_absolute_score_change || 0) * 100).toFixed(2)}
+                          {" "}points
+                        </span>
+                      </div>
+
+                      <div className="sensitivity-chart">
+                        <div className="sensitivity-chart-heading">
+                          <strong>Score sensitivity by test</strong>
+                          <span>Change relative to original audio</span>
+                        </div>
+
+                        {(Array.isArray(robustness.results)
+                          ? robustness.results
+                          : []
+                        ).map((test) => {
+                          const change = Number(test.score_change ?? 0);
+                          const valid = Number.isFinite(change);
+                          const maximum = Math.max(
+                            Number(robustness.max_absolute_score_change) || 0,
+                            0.01
+                          );
+                          const halfWidth = valid
+                            ? Math.min(50, Math.abs(change) / maximum * 50)
+                            : 0;
+
+                          return (
+                            <div
+                              className="sensitivity-chart-row"
+                              key={`sensitivity-${test.condition}`}
+                            >
+                              <div className="sensitivity-chart-label">
+                                <span>
+                                  {readableCondition(test.condition)}
+                                </span>
+                                <strong>
+                                  {!valid
+                                    ? "?"
+                                    : `${change > 0 ? "+" : ""}${(change * 100).toFixed(2)} pts`}
+                                </strong>
+                              </div>
+
+                              <div
+                                className="sensitivity-chart-track"
+                                role="img"
+                                aria-label={
+                                  valid
+                                    ? `Score change ${change > 0 ? "plus " : ""}${(change * 100).toFixed(2)} points`
+                                    : "Score change unavailable"
+                                }
+                              >
+                                <span
+                                  className={`sensitivity-bar ${
+                                    change > 0
+                                      ? "sensitivity-positive"
+                                      : change < 0
+                                        ? "sensitivity-negative"
+                                        : "sensitivity-zero"
+                                  }`}
+                                  style={{
+                                    left: change >= 0
+                                      ? "50%"
+                                      : `${50 - halfWidth}%`,
+                                    width: `${halfWidth}%`
+                                  }}
+                                />
+                              </div>
+                            </div>
+                          );
+                        })}
+
+                        <div className="sensitivity-chart-axis">
+                          <span>Score decreases</span>
+                          <span>0 change</span>
+                          <span>Score increases</span>
+                        </div>
+
+                        <p className="sensitivity-chart-note">
+                          Changes are measured in score points relative to
+                          the original recording. They indicate model
+                          sensitivity, not whether the voice is authentic.
+                        </p>
+                      </div>
+
+                      <div className="robustness-tests">
+                        {(Array.isArray(robustness.results)
+                          ? robustness.results
+                          : []
+                        ).map(test => (
+                          <div
+                            className="robustness-test-row"
+                            key={test.condition}
+                          >
+                            <div className="robustness-test-copy">
+                              <strong>
+                                {readableCondition(test.condition)}
+                              </strong>
+                              <span>
+                                {String(test.verdict || "unknown").replaceAll("_", " ")}
+                              </span>
+                            </div>
+
+                            <div className="robustness-test-value">
+                              <strong>
+                                {test.score_change == null
+                                  ? "Baseline"
+                                  : `${Number(test.score_change) >= 0 ? "+" : ""}${(Number(test.score_change) * 100).toFixed(2)} pts`}
+                              </strong>
+                              <span>
+                                {test.condition === "original"
+                                  ? "Reference"
+                                  : test.classification_changed
+                                    ? "Verdict changed"
+                                    : "Verdict unchanged"}
+                              </span>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+
+                      <p className="robustness-note">
+                        {robustness.warning ||
+                          "This diagnostic checks only the tested transformations. A stable output is not proof of authenticity or accuracy."}
+                      </p>
+                    </div>
+                  )}
+                </section>
+              </div>
+            )}
+          </section>
+        </section>
+
+        <section className="method-strip">
+          <div className="method-title">
+            <Activity size={17} strokeWidth={1.6} />
+            <span>PROCESS</span>
+          </div>
+          <div className="method-step">
+            <span>01</span> Audio preparation
+          </div>
+          <ChevronRight size={14} className="method-chevron" />
+          <div className="method-step">
+            <span>02</span> Model inference
+          </div>
+          <ChevronRight size={14} className="method-chevron" />
+          <div className="method-step">
+            <span>03</span> Result assessment
+          </div>
+        </section>
+
+        <section className="safety-section" id="safety">
+          <div className="safety-intro">
+            <div className="overline">03 — CALL SAFETY</div>
+            <h2>Something feels wrong?</h2>
+            <p>
+              Voice detection is only one part of assessing a call.
+              Select the warning signs that apply to get practical advice.
+            </p>
+          </div>
+
+          <form className="workspace-panel safety-panel" onSubmit={requestGuidance}>
+            <h3>Call circumstances</h3>
+            <p className="form-caption">
+              Select all that apply. This assessment is separate from the voice score.
+            </p>
+
+            <label className="safety-option">
+              <input
+                type="checkbox"
+                checked={answers.urgent_money_request}
+                onChange={() => toggleAnswer("urgent_money_request")}
+              />
+              <span className="custom-checkbox">
+                {answers.urgent_money_request && <Check size={12} />}
+              </span>
+              <span className="safety-option-text">
+                <strong>Urgent request for money</strong>
+                <small>I was pressured to transfer money quickly.</small>
+              </span>
+            </label>
+
+            <label className="safety-option">
+              <input
+                type="checkbox"
+                checked={answers.asks_for_otp_or_pin}
+                onChange={() => toggleAnswer("asks_for_otp_or_pin")}
+              />
+              <span className="custom-checkbox">
+                {answers.asks_for_otp_or_pin && <Check size={12} />}
+              </span>
+              <span className="safety-option-text">
+                <strong>OTP, PIN or password requested</strong>
+                <small>The caller asked for a security code or credential.</small>
+              </span>
+            </label>
+
+            <label className="safety-option">
+              <input
+                type="checkbox"
+                checked={answers.caller_claims_emergency}
+                onChange={() => toggleAnswer("caller_claims_emergency")}
+              />
+              <span className="custom-checkbox">
+                {answers.caller_claims_emergency && <Check size={12} />}
+              </span>
+              <span className="safety-option-text">
+                <strong>Claim of an emergency</strong>
+                <small>The caller claimed someone urgently needed help.</small>
+              </span>
+            </label>
+
+            <button
+              type="submit"
+              className="button button-primary guidance-button"
+              disabled={guidanceBusy}
+            >
+              {guidanceBusy ? "Getting recommendations" : "View recommendations"}
+              <ArrowRight size={15} />
+            </button>
+
+            {guidanceError && (
+              <div className="inline-error" role="alert">
+                <CircleAlert size={15} />
+                {guidanceError}
+              </div>
+            )}
+
+            {guidance.length > 0 && (
+              <div className="guidance-results">
+                <div className="guidance-heading">
+                  <Check size={15} />
+                  Recommended next steps
+                </div>
+
+                {guidance.map((item, index) => (
+                  <div className="guidance-item" key={`${item}-${index}`}>
+                    <span>{String(index + 1).padStart(2, "0")}</span>
+                    <p>{item}</p>
+                  </div>
+                ))}
+              </div>
+            )}
+          </form>
+        </section>
+
+        <section className="important-note">
+          <Info size={17} />
+          <div>
+            <strong>Read results with care</strong>
+            <p>
+              A model score is not proof of identity or fraud. A genuine voice
+              can be used in a scam, and a synthetic voice does not by itself
+              establish malicious intent. Verify urgent requests through a
+              separate, trusted channel.
+            </p>
+          </div>
+        </section>
+      </main>
+
+      <footer className="footer">
+        <a href="#" className="footer-brand">
+          <span className="brand-mark">VM</span>
+          <span>VOICEMATRIX</span>
+        </a>
+        <span>Voice analysis and call safety</span>
+        <span className="footer-model">AASIST-L / ONNX</span>
+      </footer>
+    </div>
+  );
+}
+
+export default App;

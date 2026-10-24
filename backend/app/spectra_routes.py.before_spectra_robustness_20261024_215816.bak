@@ -1,0 +1,112 @@
+﻿from fastapi import APIRouter, File, HTTPException, UploadFile
+
+from app.config import settings
+from app.schemas import DetectionResponse
+from app.services.audio_processor import AudioProcessingError, load_audio
+from app.services.reliability import assess_audio_quality
+from app.services.spectra_detector import (
+    BONAFIDE_THRESHOLD,
+    SpectraDetector,
+)
+
+
+router = APIRouter()
+spectra_detector = SpectraDetector()
+
+
+@router.get("/spectra-health")
+def spectra_health():
+    return {
+        "status": "ok" if spectra_detector.model_file_exists else "unavailable",
+        "model_name": spectra_detector.model_name,
+        "model_file_exists": spectra_detector.model_file_exists,
+        "model_loaded": spectra_detector.ready,
+        "threshold_bona_fide_logit": BONAFIDE_THRESHOLD,
+    }
+
+
+@router.post("/analyze-spectra", response_model=DetectionResponse)
+async def analyze_audio_spectra(file: UploadFile = File(...)):
+    content = await file.read(
+        settings.max_audio_size_mb * 1024 * 1024 + 1
+    )
+
+    if len(content) > settings.max_audio_size_mb * 1024 * 1024:
+        raise HTTPException(
+            status_code=413,
+            detail="Audio file is too large.",
+        )
+
+    try:
+        audio, sample_rate, duration = load_audio(
+            content,
+            settings.max_audio_duration_seconds,
+        )
+    except AudioProcessingError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
+
+    try:
+        result = spectra_detector.predict(audio, sample_rate)
+    except (FileNotFoundError, RuntimeError) as exc:
+        print("VOICEMATRIX Spectra-0 loading/inference error:", repr(exc))
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Spectra-0 is unavailable. The existing AASIST-L "
+                "endpoint remains separate and unchanged."
+            ),
+        ) from exc
+    except Exception as exc:
+        print("VOICEMATRIX Spectra-0 inference error:", repr(exc))
+        raise HTTPException(
+            status_code=500,
+            detail="Spectra-0 audio analysis failed.",
+        ) from exc
+
+    quality = assess_audio_quality(audio, sample_rate)
+
+    # Use Spectra-0's raw genuine-class logit, not AASIST-L thresholds.
+    if result.bona_fide_logit > BONAFIDE_THRESHOLD:
+        verdict = "likely_genuine"
+    else:
+        verdict = "potentially_synthetic"
+
+    warnings = [
+        "Spectra-0 is experimental in this application.",
+        "The displayed score is not a calibrated probability.",
+        "A model prediction alone does not establish identity or fraud.",
+    ]
+
+    if quality["reasons"]:
+        warnings.append(
+            "Audio-quality checks: " + "; ".join(quality["reasons"])
+        )
+
+    if result.used_repeated_padding:
+        warnings.append(
+            "The short recording was repeated to fill the model window. "
+            "Interpret this result cautiously."
+        )
+
+    return DetectionResponse(
+        verdict=verdict,
+        score=result.score,
+        reliability=quality["status"],
+        explanation=result.explanation,
+        duration_seconds=duration,
+        model_name=result.model_name,
+        inference_ms=result.inference_ms,
+        window_count=1,
+        window_score_range=None,
+        bona_fide_logit=result.bona_fide_logit,
+        window_bona_fide_logits=[result.bona_fide_logit],
+        quality_reasons=quality["reasons"],
+        audio_rms=quality["rms_level"],
+        peak_amplitude=quality["peak_amplitude"],
+        clipping_fraction=quality["clipping_fraction"],
+        near_silent_frame_fraction=quality["near_silent_frame_fraction"],
+        warning=" ".join(warnings),
+    )

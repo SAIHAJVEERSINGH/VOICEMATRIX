@@ -1,0 +1,13 @@
+﻿fastapi
+uvicorn[standard]
+python-multipart
+pydantic-settings
+numpy
+soundfile
+librosa
+transformers
+torch
+torchaudio
+scikit-learn
+pytest
+httpx
