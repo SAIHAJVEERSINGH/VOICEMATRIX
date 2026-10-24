@@ -1,0 +1,658 @@
+﻿============================================================
+FILE 1: backend/app/services/detector.py
+============================================================
+
+from dataclasses import dataclass
+from pathlib import Path
+from time import perf_counter
+
+import numpy as np
+import onnxruntime as ort
+
+
+TARGET_SAMPLES = 64600
+TARGET_SAMPLE_RATE = 16000
+HOP_SAMPLES = TARGET_SAMPLES // 2
+
+
+@dataclass
+class DetectorResult:
+    score: float
+    model_name: str
+    explanation: str
+    inference_ms: float
+    used_repeated_padding: bool
+    window_count: int
+    window_score_range: float | None
+    bona_fide_logit: float
+    window_bona_fide_logits: list[float]
+
+
+class VoiceDetector:
+    def __init__(self):
+        self.model_name = "AASIST-L ONNX"
+        self._session = None
+        self._load_error = None
+
+        model_path = (
+            Path(__file__).resolve().parents[1]
+            / "models"
+            / "aasist-l.onnx"
+        )
+
+        try:
+            if not model_path.exists():
+                raise FileNotFoundError(str(model_path))
+
+            options = ort.SessionOptions()
+            options.intra_op_num_threads = 2
+            options.inter_op_num_threads = 1
+
+            self._session = ort.InferenceSession(
+                str(model_path),
+                sess_options=options,
+                providers=["CPUExecutionProvider"],
+            )
+
+            inputs = self._session.get_inputs()
+            outputs = self._session.get_outputs()
+
+            if len(inputs) != 1 or len(outputs) != 1:
+                raise RuntimeError(
+                    "Unexpected model input/output configuration."
+                )
+
+            self._input_name = inputs[0].name
+            self._output_name = outputs[0].name
+
+            if inputs[0].shape[-1] != TARGET_SAMPLES:
+                raise RuntimeError("Unexpected model input length.")
+
+        except Exception as exc:
+            self._session = None
+            self._load_error = str(exc)
+
+    @property
+    def ready(self) -> bool:
+        return self._session is not None
+
+    def predict(
+        self,
+        audio: np.ndarray,
+        sample_rate: int,
+    ) -> DetectorResult:
+        if not self.ready:
+            raise RuntimeError(
+                "AASIST-L unavailable: " + str(self._load_error)
+            )
+
+        if sample_rate != TARGET_SAMPLE_RATE:
+            raise ValueError("Audio must be sampled at 16000 Hz.")
+
+        audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+
+        if audio.size == 0 or not np.isfinite(audio).all():
+            raise ValueError("Audio is empty or invalid.")
+
+        used_repeated_padding = audio.size < TARGET_SAMPLES
+
+        if used_repeated_padding:
+            repeats = TARGET_SAMPLES // audio.size + 1
+            windows = [
+                np.tile(audio, repeats)[:TARGET_SAMPLES]
+            ]
+        else:
+            last_start = audio.size - TARGET_SAMPLES
+            starts = list(range(0, last_start + 1, HOP_SAMPLES))
+
+            if not starts or starts[-1] != last_start:
+                starts.append(last_start)
+
+            windows = [
+                audio[start:start + TARGET_SAMPLES]
+                for start in starts
+            ]
+
+        model_input = np.ascontiguousarray(
+            np.stack(windows),
+            dtype=np.float32,
+        )
+
+        started = perf_counter()
+
+        output = self._session.run(
+            [self._output_name],
+            {self._input_name: model_input},
+        )[0]
+
+        inference_ms = (perf_counter() - started) * 1000
+
+        logits = np.asarray(output, dtype=np.float64)
+
+        if (
+            logits.ndim != 2
+            or logits.shape != (len(windows), 2)
+            or not np.isfinite(logits).all()
+        ):
+            raise RuntimeError("The model returned unexpected output.")
+
+        # Class index 1 is bona-fide speech.
+        # Preserve the raw logit for analysis.
+        raw_bona_fide_logits = logits[:, 1]
+
+        # Retain the previous normalized score for backward compatibility.
+        # Softmax values are not calibrated probabilities.
+        shifted = logits - np.max(logits, axis=1, keepdims=True)
+        exponentials = np.exp(shifted)
+        normalized = exponentials / exponentials.sum(
+            axis=1, keepdims=True
+        )
+        genuine_scores = normalized[:, 1]
+
+        score_range = (
+            float(np.max(genuine_scores) - np.min(genuine_scores))
+            if len(genuine_scores) > 1
+            else None
+        )
+
+        return DetectorResult(
+            score=float(np.mean(genuine_scores)),
+            model_name=self.model_name,
+            explanation=(
+                "AASIST-L analyzes overlapping audio windows. The existing "
+                "normalized score is retained for compatibility; raw "
+                "bona-fide logits are also provided for evaluation. Neither "
+                "output is a calibrated probability."
+            ),
+            inference_ms=round(inference_ms, 2),
+            used_repeated_padding=used_repeated_padding,
+            window_count=len(windows),
+            window_score_range=(
+                round(score_range, 6)
+                if score_range is not None
+                else None
+            ),
+            bona_fide_logit=float(np.mean(raw_bona_fide_logits)),
+            window_bona_fide_logits=[
+                float(value) for value in raw_bona_fide_logits
+            ],
+        )
+
+
+============================================================
+FILE 2: backend/app/routes.py
+============================================================
+
+from fastapi import APIRouter, File, HTTPException, UploadFile
+from pydantic import BaseModel
+
+from app.config import settings
+from app.schemas import DetectionResponse, HealthResponse
+from app.services.audio_processor import AudioProcessingError, load_audio
+from app.services.detector import VoiceDetector
+from app.services.reliability import assess_audio_quality
+from app.services.robustness import run_robustness_scan
+from app.services.scam_guidance import get_scam_guidance
+
+
+router = APIRouter()
+detector = VoiceDetector()
+
+
+class GuidanceRequest(BaseModel):
+    urgent_money_request: bool = False
+    asks_for_otp_or_pin: bool = False
+    caller_claims_emergency: bool = False
+
+
+@router.get("/health", response_model=HealthResponse)
+def health():
+    return HealthResponse(
+        status="ok",
+        app=settings.app_name,
+        detector_ready=detector.ready,
+    )
+
+
+@router.post("/analyze", response_model=DetectionResponse)
+async def analyze_audio(file: UploadFile = File(...)):
+    content = await file.read(
+        settings.max_audio_size_mb * 1024 * 1024 + 1
+    )
+
+    if len(content) > settings.max_audio_size_mb * 1024 * 1024:
+        raise HTTPException(
+            status_code=413,
+            detail="Audio file is too large.",
+        )
+
+    try:
+        audio, sample_rate, duration = load_audio(
+            content,
+            settings.max_audio_duration_seconds,
+        )
+    except AudioProcessingError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
+
+    if not detector.ready:
+        raise HTTPException(
+            status_code=503,
+            detail="AASIST-L is unavailable. Check the model file and server logs.",
+        )
+
+    try:
+        result = detector.predict(audio, sample_rate)
+    except Exception as exc:
+        print("VOICEMATRIX inference error:", repr(exc))
+        raise HTTPException(
+            status_code=500,
+            detail="Audio analysis failed.",
+        ) from exc
+
+    quality = assess_audio_quality(audio, sample_rate)
+
+    # These thresholds remain provisional until calibrated on development data.
+    if result.score >= 0.70:
+        verdict = "likely_genuine"
+    elif result.score <= 0.30:
+        verdict = "potentially_synthetic"
+    else:
+        verdict = "inconclusive"
+
+    warnings = [
+        "Model scores are not calibrated probabilities.",
+        "A model result alone does not establish identity or fraud.",
+    ]
+
+    if quality["reasons"]:
+        warnings.append(
+            "Audio-quality checks: " + "; ".join(quality["reasons"])
+        )
+
+    if result.used_repeated_padding:
+        warnings.append(
+            "The recording was repeated to fill the model window. "
+            "Interpret short-clip results cautiously."
+        )
+
+    # Conservative Decision Guard:
+    # downgrade a decisive result when existing diagnostics indicate
+    # that the available evidence may not support a reliable decision.
+    score_disagreement = (
+        result.window_score_range is not None
+        and result.window_score_range >= 0.25
+    )
+
+    if score_disagreement:
+        warnings.append(
+            "Scores vary substantially across windows. "
+            "Treat the classification with extra caution."
+        )
+
+    guard_reasons = []
+
+    if quality.get("status") in {"limited", "insufficient_data"}:
+        guard_reasons.append(
+            "audio-quality checks indicate limited or insufficient evidence"
+        )
+
+    if score_disagreement:
+        guard_reasons.append(
+            "the genuine-speech scores vary substantially across windows"
+        )
+
+    if guard_reasons:
+        previous_verdict = verdict
+
+        if previous_verdict == "inconclusive":
+            warnings.append(
+                "Conservative Decision Guard confirmed that the result "
+                "should remain inconclusive because: "
+                + "; ".join(guard_reasons)
+                + ". This safeguard identifies warning signs; it cannot "
+                  "detect every model generalization error."
+            )
+        else:
+            verdict = "inconclusive"
+
+            warnings.append(
+                "Conservative Decision Guard downgraded the result from "
+                f"{previous_verdict.replace('_', ' ')} to inconclusive because: "
+                + "; ".join(guard_reasons)
+                + ". This safeguard identifies warning signs; it cannot "
+                  "detect every model generalization error."
+            )
+
+    return DetectionResponse(
+        verdict=verdict,
+        score=result.score,
+        reliability=quality["status"],
+        explanation=result.explanation,
+        duration_seconds=duration,
+        model_name=result.model_name,
+        inference_ms=result.inference_ms,
+        window_count=result.window_count,
+        window_score_range=result.window_score_range,
+        bona_fide_logit=result.bona_fide_logit,
+        window_bona_fide_logits=result.window_bona_fide_logits,
+        quality_reasons=quality["reasons"],
+        audio_rms=quality["rms_level"],
+        peak_amplitude=quality["peak_amplitude"],
+        clipping_fraction=quality["clipping_fraction"],
+        near_silent_frame_fraction=quality["near_silent_frame_fraction"],
+        warning=" ".join(warnings),
+    )
+
+
+@router.post("/robustness")
+async def robustness_scan(file: UploadFile = File(...)):
+    content = await file.read(
+        settings.max_audio_size_mb * 1024 * 1024 + 1
+    )
+
+    if len(content) > settings.max_audio_size_mb * 1024 * 1024:
+        raise HTTPException(
+            status_code=413,
+            detail="Audio file is too large.",
+        )
+
+    try:
+        audio, sample_rate, duration = load_audio(
+            content,
+            settings.max_audio_duration_seconds,
+        )
+    except AudioProcessingError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
+
+    if not 2.0 <= duration <= 10.0:
+        raise HTTPException(
+            status_code=400,
+            detail="Robustness testing requires audio between 2 and 10 seconds.",
+        )
+
+    if not detector.ready:
+        raise HTTPException(
+            status_code=503,
+            detail="AASIST-L is unavailable.",
+        )
+
+    try:
+        return run_robustness_scan(
+            audio=audio,
+            sample_rate=sample_rate,
+            detector=detector,
+        )
+    except Exception as exc:
+        print("VOICEMATRIX robustness scan error:", repr(exc))
+        raise HTTPException(
+            status_code=500,
+            detail="Robustness analysis failed.",
+        ) from exc
+
+
+@router.post("/guidance")
+def scam_guidance(request: GuidanceRequest):
+    return {
+        "recommendations": get_scam_guidance(
+            urgent_money_request=request.urgent_money_request,
+            asks_for_otp_or_pin=request.asks_for_otp_or_pin,
+            caller_claims_emergency=request.caller_claims_emergency,
+        )
+    }
+
+
+============================================================
+FILE 3: backend/app/services/audio_processor.py
+============================================================
+
+from fractions import Fraction
+from io import BytesIO
+import subprocess
+
+import numpy as np
+import soundfile as sf
+from scipy.signal import resample_poly
+
+
+TARGET_SAMPLE_RATE = 16000
+
+
+class AudioProcessingError(ValueError):
+    pass
+
+
+def _decode_with_ffmpeg(
+    content: bytes,
+    max_duration_seconds: int,
+):
+    try:
+        probe = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                "pipe:0",
+            ],
+            input=content,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        raise AudioProcessingError(
+            "Audio decoding failed. Check that FFmpeg is installed."
+        ) from exc
+
+    if probe.returncode != 0:
+        raise AudioProcessingError(
+            "Could not decode this audio. Try a WAV, FLAC, or MP3 file."
+        )
+
+    try:
+        duration = float(probe.stdout.decode("utf-8").strip())
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise AudioProcessingError(
+            "Could not determine the audio duration."
+        ) from exc
+
+    if not np.isfinite(duration) or duration <= 0:
+        raise AudioProcessingError("The audio duration is invalid.")
+
+    if duration > max_duration_seconds:
+        raise AudioProcessingError(
+            f"Audio must be {max_duration_seconds} seconds or shorter."
+        )
+
+    try:
+        decoded = subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel", "error",
+                "-i", "pipe:0",
+                "-vn",
+                "-ac", "1",
+                "-ar", str(TARGET_SAMPLE_RATE),
+                "-f", "f32le",
+                "pipe:1",
+            ],
+            input=content,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        raise AudioProcessingError(
+            "FFmpeg could not decode the uploaded audio."
+        ) from exc
+
+    if decoded.returncode != 0 or not decoded.stdout:
+        raise AudioProcessingError(
+            "FFmpeg could not decode the uploaded audio."
+        )
+
+    audio = np.frombuffer(decoded.stdout, dtype="<f4").copy()
+    return audio, TARGET_SAMPLE_RATE, duration
+
+
+def load_audio(
+    content: bytes,
+    max_duration_seconds: int = 10,
+):
+    if not content:
+        raise AudioProcessingError("The uploaded audio file is empty.")
+
+    try:
+        audio, sample_rate = sf.read(
+            BytesIO(content),
+            dtype="float32",
+            always_2d=False,
+        )
+        if audio.ndim == 2:
+            audio = audio.mean(axis=1)
+
+        if audio.ndim != 1 or audio.size == 0:
+            raise AudioProcessingError("No usable audio was found.")
+
+        if sample_rate <= 0:
+            raise AudioProcessingError("The sample rate is invalid.")
+
+        duration = len(audio) / sample_rate
+
+        if duration > max_duration_seconds:
+            raise AudioProcessingError(
+                f"Audio must be {max_duration_seconds} seconds or shorter."
+            )
+
+        if sample_rate != TARGET_SAMPLE_RATE:
+            ratio = Fraction(
+                TARGET_SAMPLE_RATE,
+                sample_rate,
+            ).limit_denominator()
+
+            audio = resample_poly(
+                audio,
+                ratio.numerator,
+                ratio.denominator,
+            ).astype(np.float32)
+
+        sample_rate = TARGET_SAMPLE_RATE
+
+    except AudioProcessingError:
+        raise
+    except Exception:
+        audio, sample_rate, duration = _decode_with_ffmpeg(
+            content,
+            max_duration_seconds,
+        )
+
+    if audio.ndim != 1 or audio.size == 0:
+        raise AudioProcessingError("No usable audio was found.")
+
+    if not np.isfinite(audio).all():
+        raise AudioProcessingError("The audio contains invalid values.")
+
+    if np.max(np.abs(audio)) == 0:
+        raise AudioProcessingError("The recording is silent.")
+
+    if "duration" not in locals():
+        duration = len(audio) / sample_rate
+
+    if duration < 2.0:
+        raise AudioProcessingError(
+            "Audio must be at least 2 seconds long."
+        )
+
+    if duration > max_duration_seconds:
+        raise AudioProcessingError(
+            f"Audio must be {max_duration_seconds} seconds or shorter."
+        )
+
+    return audio.astype(np.float32), sample_rate, float(duration)
+
+
+============================================================
+FILE 4: backend/app/config.py
+============================================================
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+class Settings(BaseSettings):
+    app_name: str = "VOICEMATRIX"
+    max_audio_size_mb: int = 15
+    max_audio_duration_seconds: int = 10
+    allowed_origins: str = "http://localhost:5173"
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+settings = Settings()
+
+
+============================================================
+FILE 5: backend/app/schemas.py
+============================================================
+
+from typing import Literal
+
+from pydantic import BaseModel, Field
+
+
+class HealthResponse(BaseModel):
+    status: Literal["ok"]
+    app: str
+    detector_ready: bool
+
+
+class DetectionResponse(BaseModel):
+    verdict: Literal[
+        "likely_genuine",
+        "potentially_synthetic",
+        "inconclusive",
+    ]
+
+    # Existing normalized score, retained for frontend compatibility.
+    score: float | None = Field(default=None, ge=0.0, le=1.0)
+
+    reliability: Literal[
+        "experimental",
+        "limited",
+        "insufficient_data",
+    ]
+
+    explanation: str
+    duration_seconds: float
+    model_name: str
+
+    inference_ms: float = Field(default=0.0, ge=0.0)
+    window_count: int = Field(default=1, ge=1)
+    window_score_range: float | None = Field(
+        default=None, ge=0.0, le=1.0
+    )
+
+    # Additional diagnostic fields; older frontend fields remain unchanged.
+    bona_fide_logit: float | None = None
+    window_bona_fide_logits: list[float] = Field(default_factory=list)
+    quality_reasons: list[str] = Field(default_factory=list)
+
+    audio_rms: float | None = Field(default=None, ge=0.0)
+    peak_amplitude: float | None = Field(default=None, ge=0.0)
+    clipping_fraction: float | None = Field(
+        default=None, ge=0.0, le=1.0
+    )
+    near_silent_frame_fraction: float | None = Field(
+        default=None, ge=0.0, le=1.0
+    )
+
+    warning: str
+
